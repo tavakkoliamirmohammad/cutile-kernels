@@ -15,6 +15,9 @@ The project includes the following kernel implementations:
 - **Fast Fourier Transform (`fft.py`)**: Implementation of the FFT algorithm.
 - **1D Stencil (`stencil1d.py`)**: A 1D stencil operation, typical in signal processing and simulations.
 - **Tensor Contraction (`tensor_contraction_gen.py`)**: A generator for various tensor contraction operations.
+- **Dot Product (`dot_product.py`)**: Computes the dot product of two vectors.
+- **L1 Norm (`norm1.py`)**: Calculates the L1 norm of a vector.
+- **L2 Norm (`norm2.py`)**: Calculates the L2 norm of a vector.
 
 ## Requirements
 

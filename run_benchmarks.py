@@ -18,10 +18,13 @@ def run_script(script_name, args=[]):
 def main():
     scripts = [
         "batch_matmul.py",
+        "dot_product.py",
         "fft.py",
         "layernorm.py",
         "matmul.py",
         "moe.py",
+        "norm1.py",
+        "norm2.py",
         "stencil1d.py",
         "tensor_contraction_gen.py",
         "transpose.py",

@@ -1,9 +1,15 @@
-import cupy as cp
-import numpy as np
+import argparse
+import torch
 import cuda.tile as ct
+import math
+
+ConstInt = ct.Constant[int]
 
 @ct.kernel
-def norm1_kernel(a, result, tile_size: ct.Constant[int]):
+def norm1_kernel(a, result, tile_size: ConstInt):
+    """
+    cuTile kernel for computing the L1 norm of a vector.
+    """
     pid = ct.bid(0)
     
     # Load input tile
@@ -16,36 +22,56 @@ def norm1_kernel(a, result, tile_size: ct.Constant[int]):
     partial_sum = ct.sum(abs_tile)
     
     # Atomically add partial sum to global result
-    # FIX: Pass arguments positionally
     ct.atomic_add(result, (0,), partial_sum)
 
-def run_test():
-    N = 1024 * 1024
-    TILE_SIZE = 1024
+def norm1(a: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper for L1 norm kernel.
+    """
+    if not a.is_cuda:
+        raise ValueError("Input tensor must be on a CUDA device.")
     
-    # Generate Data
-    a_gpu = cp.random.uniform(-1.0, 1.0, N).astype(cp.float32)
-    result_gpu = cp.zeros(1, dtype=cp.float32)
+    N = a.shape[0]
+    TILE_SIZE = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
     
-    # Launch Config
-    grid = (ct.cdiv(N, TILE_SIZE), 1, 1)
+    result = torch.zeros(1, dtype=a.dtype, device=a.device)
     
-    print("Launching Norm 1 kernel...")
+    grid = (math.ceil(N / TILE_SIZE), 1, 1)
+    
     ct.launch(
-        cp.cuda.get_current_stream(),
+        torch.cuda.current_stream(),
         grid,
         norm1_kernel,
-        (a_gpu, result_gpu, TILE_SIZE)
+        (a, result, TILE_SIZE)
     )
     
-    # Verification
-    cutile_res = float(result_gpu.get())
-    numpy_res = float(np.sum(np.abs(cp.asnumpy(a_gpu))))
+    return result
+
+def run_test():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--correctness-check",
+        action="store_true",
+        help="Check the correctness of the results",
+        default=True,
+    )
+    args = parser.parse_args()
+
+    N = 1024 * 1024
     
-    print(f"cuTile: {cutile_res:.4f}")
-    print(f"Numpy:  {numpy_res:.4f}")
-    np.testing.assert_allclose(cutile_res, numpy_res, rtol=1e-4)
-    print("✓ Norm 1 Passed")
+    # Generate Data
+    a = torch.randn(N, dtype=torch.float32, device='cuda')
+    
+    print(f"Launching Norm 1 kernel with N={N}...")
+    cutile_res = norm1(a)
+    
+    # Verification
+    if args.correctness_check:
+        torch_res = torch.norm(a, p=1)
+        print(f"cuTile:  {cutile_res.item():.4f}")
+        print(f"PyTorch: {torch_res.item():.4f}")
+        torch.testing.assert_close(cutile_res[0], torch_res, rtol=1e-4, atol=1e-4)
+        print("✓ Norm 1 Passed")
 
 if __name__ == "__main__":
     run_test()

@@ -1,9 +1,15 @@
-import cupy as cp
-import numpy as np
+import argparse
+import torch
 import cuda.tile as ct
+import math
+
+ConstInt = ct.Constant[int]
 
 @ct.kernel
-def dot_product_kernel(a, b, result, tile_size: ct.Constant[int]):
+def dot_product_kernel(a, b, result, tile_size: ConstInt):
+    """
+    cuTile kernel for computing the dot product of two vectors.
+    """
     pid = ct.bid(0)
     
     # Load input tiles
@@ -17,37 +23,60 @@ def dot_product_kernel(a, b, result, tile_size: ct.Constant[int]):
     partial_sum = ct.sum(prod)
     
     # Atomically add partial sum to global result
-    # FIX: Pass arguments positionally: (array, indices, update)
     ct.atomic_add(result, (0,), partial_sum)
 
-def run_test():
-    N = 1024 * 1024
-    TILE_SIZE = 1024
+def dot_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper for dot product kernel.
+    """
+    if a.shape != b.shape:
+        raise ValueError("Input tensors must have the same shape.")
+    if not a.is_cuda or not b.is_cuda:
+        raise ValueError("Input tensors must be on a CUDA device.")
     
-    # Generate Data
-    a_gpu = cp.random.uniform(-1.0, 1.0, N).astype(cp.float32)
-    b_gpu = cp.random.uniform(-1.0, 1.0, N).astype(cp.float32)
-    result_gpu = cp.zeros(1, dtype=cp.float32)
+    N = a.shape[0]
+    # Use a tile size of 1024 or smaller
+    TILE_SIZE = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
     
-    # Launch Config
-    grid = (ct.cdiv(N, TILE_SIZE), 1, 1)
+    result = torch.zeros(1, dtype=a.dtype, device=a.device)
     
-    print("Launching Dot Product kernel...")
+    grid = (math.ceil(N / TILE_SIZE), 1, 1)
+    
     ct.launch(
-        cp.cuda.get_current_stream(),
+        torch.cuda.current_stream(),
         grid,
         dot_product_kernel,
-        (a_gpu, b_gpu, result_gpu, TILE_SIZE)
+        (a, b, result, TILE_SIZE)
     )
     
-    # Verification
-    cutile_res = float(result_gpu.get())
-    numpy_res = float(np.dot(cp.asnumpy(a_gpu), cp.asnumpy(b_gpu)))
+    return result
+
+def run_test():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--correctness-check",
+        action="store_true",
+        help="Check the correctness of the results",
+        default=True,
+    )
+    args = parser.parse_args()
+
+    N = 1024 * 1024
     
-    print(f"cuTile: {cutile_res:.4f}")
-    print(f"Numpy:  {numpy_res:.4f}")
-    np.testing.assert_allclose(cutile_res, numpy_res, rtol=1e-4)
-    print("✓ Dot Product Passed")
+    # Generate Data
+    a = torch.randn(N, dtype=torch.float32, device='cuda')
+    b = torch.randn(N, dtype=torch.float32, device='cuda')
+    
+    print(f"Launching Dot Product kernel with N={N}...")
+    cutile_res = dot_product(a, b)
+    
+    # Verification
+    if args.correctness_check:
+        torch_res = torch.dot(a, b)
+        print(f"cuTile: {cutile_res.item():.4f}")
+        print(f"PyTorch: {torch_res.item():.4f}")
+        torch.testing.assert_close(cutile_res[0], torch_res, rtol=1e-4, atol=1e-4)
+        print("✓ Dot Product Passed")
 
 if __name__ == "__main__":
     run_test()
