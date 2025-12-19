@@ -7,6 +7,7 @@ A collection of high-performance GPU kernel implementations using `cuda.tile`, a
 The project includes the following kernel implementations:
 
 - **Vector Addition (`vecadd.py`)**: A basic example of element-wise vector addition.
+- **BabelStream (`babelstream.py`)**: A set of memory-bandwidth benchmarks (Copy, Mul, Add, Triad, Dot).
 - **Matrix Multiplication (`matmul.py`)**: Standard and persistent matrix multiplication kernels.
 - **Batched Matrix Multiplication (`batch_matmul.py`)**: Efficiently performing multiple matrix multiplications in a single kernel call.
 - **Layer Normalization (`layernorm.py`)**: Forward and backward passes for LayerNorm, commonly used in Transformer models.

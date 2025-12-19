@@ -17,6 +17,7 @@ def run_script(script_name, args=[]):
 
 def main():
     scripts = [
+        "babelstream.py",
         "batch_matmul.py",
         "dot_product.py",
         "fft.py",
