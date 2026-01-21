@@ -25,7 +25,7 @@ def dot_product_kernel(a, b, result, tile_size: ConstInt):
     # Atomically add partial sum to global result
     ct.atomic_add(result, (0,), partial_sum)
 
-def dot_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def dot_product(a: torch.Tensor, b: torch.Tensor, tile_size: int) -> torch.Tensor:
     """
     Wrapper for dot product kernel.
     """
@@ -36,7 +36,8 @@ def dot_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     
     N = a.shape[0]
     # Use a tile size of 1024 or smaller
-    TILE_SIZE = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
+    # TILE_SIZE = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
+    TILE_SIZE = tile_size
     
     result = torch.zeros(1, dtype=a.dtype, device=a.device)
     
@@ -52,18 +53,18 @@ def dot_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return result
 
 
-def benchmark():
+def benchmark(tile_size: int):
     import time
     print(f"{'N':<10} | {'cuTile (ms)':<15} | {'PyTorch (ms)':<15} | {'Speedup':<10}")
     print("-" * 60)
     
-    for power in range(7, 21): # 2^7 to 2^20
+    for power in range(7, 30): # 2^7 to 2^20
         N = 2 ** power
         a = torch.randn(N, dtype=torch.float32, device='cuda')
         b = torch.randn(N, dtype=torch.float32, device='cuda')
         
         # Warmup and Correctness Check
-        cutile_res = dot_product(a, b)
+        cutile_res = dot_product(a, b, tile_size)
         torch_res = torch.dot(a, b)
         torch.testing.assert_close(cutile_res[0], torch_res, rtol=1e-4, atol=1e-4)
         
@@ -74,7 +75,7 @@ def benchmark():
         torch.cuda.synchronize()
         start_event.record()
         for _ in range(100):
-            dot_product(a, b)
+            dot_product(a, b, tile_size)
         end_event.record()
         torch.cuda.synchronize()
         cutile_time = start_event.elapsed_time(end_event) / 100
@@ -94,6 +95,12 @@ def benchmark():
 def run_test():
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--tile-size",
+        default=2048,
+        type=int,          # Ensures command line input is converted to int
+        help="Size of the tile"
+    )
+    parser.add_argument(
         "--correctness-check",
         action="store_true",
         help="Check the correctness of the results",
@@ -108,7 +115,7 @@ def run_test():
     args = parser.parse_args()
 
     if args.benchmark:
-        benchmark()
+        benchmark(args.tile_size)
         return
 
     N = 1024 * 1024
