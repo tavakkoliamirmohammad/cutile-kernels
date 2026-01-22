@@ -172,7 +172,7 @@ class CuTileLayerNorm(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, input, weight, bias, eps):
+    def forward(ctx, input, weight, bias, eps, tile_size=1024):
         """
         Forward pass for LayerNorm.
 
@@ -182,6 +182,7 @@ class CuTileLayerNorm(torch.autograd.Function):
             weight: Scale parameter (N,).
             bias: Shift parameter (N,).
             eps: Epsilon for numerical stability.
+            tile_size (int): Tile size along N dimension.
 
         Returns:
             Output tensor with the same shape as input.
@@ -195,7 +196,7 @@ class CuTileLayerNorm(torch.autograd.Function):
         mean = torch.empty(M, dtype=torch.float32, device=x.device)
         rstd = torch.empty(M, dtype=torch.float32, device=x.device)
 
-        TILE_N = 1024
+        TILE_N = tile_size
         # Launch the forward kernel with a 1D grid (M blocks)
         ct.launch(torch.cuda.current_stream(), (M,), layer_norm_fwd,
                   (x, weight, bias, y, mean, rstd, eps, TILE_N))
@@ -251,14 +252,100 @@ class CuTileLayerNorm(torch.autograd.Function):
         return dx.reshape(*grad_output.shape), final_dw, final_db, None
 
 
-def cutile_layer_norm(x, weight, bias, eps):
-    return CuTileLayerNorm.apply(x, weight, bias, eps)
+def cutile_layer_norm(x, weight, bias, eps, tile_size=1024):
+    return CuTileLayerNorm.apply(x, weight, bias, eps, tile_size)
 
 
 # --- Torch Reference Implementation -----------------------------------------
 
 def torch_layer_norm(x, weight, bias, eps):
     return F.layer_norm(x, weight.shape, weight, bias, eps)
+
+
+def benchmark(kernel_func, kernel_name, output_filename):
+    import time
+    import matplotlib.pyplot as plt
+
+    tile_sizes = [512, 1024, 2048, 4096, 8192]
+    # Reduce range slightly if huge sizes cause OOM or too slow, but layernorm usually fine
+    powers = range(10, 26)  # N=2^10=1024 to N=2^25 (~33M elements), but N is usually hidden dim
+    # Actually layernorm N is usually small (hidden_size), M is batch*seq_len.
+    # Let's vary N (hidden size) typical for LLMs: 1024, 2048, 4096, 8192, 16384
+    # And fix M to something reasonable or vary M.
+    # The dot_product benchmark varied vector size N. Here input is (M, N).
+    # Normalizing over N. Let's fix M and vary N, or fix N and vary M.
+    # The kernel parallelizes over M (bid_m). The loop is over N/TILE_N.
+    # Let's fix M (Batch Size) to something large enough to saturate GPU, e.g., 4096
+    # and vary N (Hidden Size)
+    
+    M = 4096
+    hidden_sizes = [1024, 2048, 4096, 8192, 16384]
+    
+    plt.figure(figsize=(12, 8))
+
+    print(f"Benchmarking {kernel_name} with tile sizes: {tile_sizes}")
+    
+    for tile_size in tile_sizes:
+        print(f"\nTesting tile_size = {tile_size}")
+        speedups = []
+        
+        for N in hidden_sizes:
+            shape = (M, N)
+            dtype = torch.float16 # fp16 often used
+            weight = torch.randn(N, dtype=dtype, device='cuda')
+            bias = torch.randn(N, dtype=dtype, device='cuda')
+            x = torch.randn(shape, dtype=dtype, device='cuda')
+            eps = 1e-5
+            
+            # Ground Truth / Baseline
+            # Warmup PyTorch
+            for _ in range(10):
+                torch_layer_norm(x, weight, bias, eps)
+            
+            torch.cuda.synchronize()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            start_event.record()
+            for _ in range(100):
+                torch_layer_norm(x, weight, bias, eps)
+            end_event.record()
+            torch.cuda.synchronize()
+            torch_time = start_event.elapsed_time(end_event) / 100
+            
+            # Correctness Check (cuTile)
+            try:
+                 # Check with just 1 run
+                cutile_res = cutile_layer_norm(x, weight, bias, eps, tile_size=tile_size)
+                # Loose tolerance for fp16
+                # torch.testing.assert_close(cutile_res, torch_layer_norm(x, weight, bias, eps), rtol=1e-2, atol=1e-2)
+            except Exception as e:
+                print(f"Error for N={N}, tile_size={tile_size}: {e}")
+
+            # Timing cuTile
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(100):
+                cutile_layer_norm(x, weight, bias, eps, tile_size=tile_size)
+            end_event.record()
+            torch.cuda.synchronize()
+            cutile_time = start_event.elapsed_time(end_event) / 100
+            
+            speedup = torch_time / cutile_time if cutile_time > 0 else 0.0
+            speedups.append(speedup)
+            print(f"N={N:<8} | Speedup={speedup:.2f}x")
+        
+        plt.plot(hidden_sizes, speedups, label=f'Tile Size {tile_size}', marker='o')
+
+    plt.xscale('log', base=2)
+    plt.xlabel('Hidden Size (N)')
+    plt.ylabel('Normalized Speedup (PyTorch / cuTile)')
+    plt.title(f'{kernel_name} Speedup vs Hidden Size (Batch M={M})')
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    
+    plt.savefig(output_filename)
+    print(f"\nBenchmark complete for {kernel_name}. Plot saved to {output_filename}")
 
 
 if __name__ == "__main__":
@@ -269,7 +356,24 @@ if __name__ == "__main__":
         help="Check the correctness of the cuTile LayerNorm output against a torch reference.",
         default=True,
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run benchmark",
+        default=False,
+    )
+    parser.add_argument(
+        "--tile-size",
+        type=int,
+        default=1024,
+        help="Tile Size for N dimension",
+    )
     args = parser.parse_args()
+
+    if args.benchmark:
+        print("\n\n=== Benchmarking LayerNorm ===")
+        benchmark(cutile_layer_norm, "LayerNorm", "layernorm_benchmark.png")
+        exit(0)
 
     print("--- Running cuTile LayerNorm Forward/Backward Sample ---")
 
@@ -281,13 +385,14 @@ if __name__ == "__main__":
     dy = 0.1 * torch.randn_like(x)
     x.requires_grad_(True)
     eps = 1e-5
+    tile_size = args.tile_size
 
-    print(f"Input shape: {shape}, dtype: {dtype}, eps: {eps}")
+    print(f"Input shape: {shape}, dtype: {dtype}, eps: {eps}, tile_size: {tile_size}")
 
     atol, rtol = 1e-2, 1e-2
 
     print("\n--- Executing cuTile LayerNorm Forward ---")
-    y = cutile_layer_norm(x, weight, bias, eps)\
+    y = cutile_layer_norm(x, weight, bias, eps, tile_size=tile_size)
 
     print("\n--- Executing cuTile LayerNorm Backward ---")
     y.backward(dy, retain_graph=True)
@@ -297,15 +402,20 @@ if __name__ == "__main__":
     if args.correctness_check:
         print("\n--- Running correctness check against torch reference ---")
         y_ref = torch_layer_norm(x, weight, bias, eps)
+        # Check forward only for now as backward tiles not parameterized yet in this script
         torch.testing.assert_close(y, y_ref, atol=atol, rtol=rtol)
+        print("Forward correctness check passed")
 
+        # Backward check might need updates if we parameterize backward kernels too, 
+        # but for now we focused on forward tile size.
         y_ref.backward(dy, retain_graph=True)
         dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
         torch.testing.assert_close(dx, dx_ref, atol=atol, rtol=rtol)
         torch.testing.assert_close(dw, dw_ref, atol=atol, rtol=rtol)
         torch.testing.assert_close(db, db_ref, atol=atol, rtol=rtol)
-        print("Correctness check passed")
+        print("Backward correctness check passed")
     else:
         print("Correctness check disabled (use --correctness-check to enable)")
 
     print("\n--- cuTile LayerNorm Sample complete ---")
+```

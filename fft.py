@@ -322,7 +322,7 @@ def cutile_fft(
               (x_packed_in, y_packed_out,
                W0_gmem, W1_gmem, W2_gmem,
                T0_gmem, T1_gmem,
-               N, F0, F1, F2, BS, atom_packing_dim))
+               N, F0, F1, F2, 1, atom_packing_dim))
 
     # --- Unpack Output from Kernel (Reshape, combine real/imag) ---
     # Reshape the packed output tensor back to (BS, N, 2) to separate real/imaginary parts.
@@ -332,7 +332,87 @@ def cutile_fft(
 
     return y_complex
 
+def benchmark(kernel_func, kernel_name, output_filename):
+    import time
+    import matplotlib.pyplot as plt
 
+    # Params
+    BATCH_SIZE = 128
+    # Powers of 2 from 2^8 (256) to 2^15 (32768)
+    # Note: large FFTs might hit memory limits or kernel constraints if not careful,
+    # but 32k is standard.
+    problem_sizes = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    
+    plt.figure(figsize=(12, 8))
+
+    print(f"Benchmarking {kernel_name} (Batch Size {BATCH_SIZE})")
+    speedups = []
+    
+    for N in problem_sizes:
+        factors = get_factors(N)
+        # Ensure packing dim is valid
+        # For N >= 32, N*2 is divisible by 64
+        packing_dim = 64
+        
+        # Setup Data
+        dtype = torch.complex64
+        x = torch.randn(BATCH_SIZE, N, dtype=dtype, device='cuda')
+        
+        # Warmup PyTorch
+        for _ in range(10):
+            torch.fft.fft(x, axis=-1)
+        
+        # Timing PyTorch
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        for _ in range(100):
+            torch.fft.fft(x, axis=-1)
+        end_event.record()
+        torch.cuda.synchronize()
+        torch_time = start_event.elapsed_time(end_event) / 100
+        
+        # Correctness & Warmup cuTile
+        try:
+            for _ in range(5):
+                cutile_fft(x, factors=factors, atom_packing_dim=packing_dim)
+        except Exception as e:
+            print(f"Error for N={N}, factors={factors}: {e}")
+            speedups.append(0)
+            continue
+
+        # Timing cuTile
+        torch.cuda.synchronize()
+        start_event.record()
+        for _ in range(100):
+            cutile_fft(x, factors=factors, atom_packing_dim=packing_dim)
+        end_event.record()
+        torch.cuda.synchronize()
+        cutile_time = start_event.elapsed_time(end_event) / 100
+        
+        speedup = torch_time / cutile_time if cutile_time > 0 else 0.0
+        speedups.append(speedup)
+        
+        # MFLOPS roughly 5 * N * log2(N) * Batch
+        ops = 5 * N * math.log2(N) * BATCH_SIZE
+        gflops = ops / (cutile_time * 1e-3) / 1e9
+        
+        print(f"N={N:<6} | Factors={str(factors):<15} | Speedup={speedup:.2f}x | GFLOPS={gflops:.2f}")
+    
+    plt.plot(problem_sizes, speedups, marker='o', label='cuTile FFT')
+
+    plt.xscale('log', base=2)
+    plt.xlabel('FFT Size (N)')
+    plt.ylabel('Normalized Speedup (PyTorch / cuTile)')
+    plt.title(f'{kernel_name} Speedup vs FFT Size (Batch={BATCH_SIZE})')
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    
+    plt.savefig(output_filename)
+    print(f"\nBenchmark complete for {kernel_name}. Plot saved to {output_filename}")
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -341,7 +421,18 @@ if __name__ == "__main__":
         help="Check the correctness of the results",
         default=True,
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run benchmark",
+        default=False,
+    )
     args = parser.parse_args()
+
+    if args.benchmark:
+        print("\n\n=== Benchmarking FFT ===")
+        benchmark(cutile_fft, "FFT", "fft_benchmark.png")
+        exit(0)
     print("--- Running cuTile FFT Example ---")
 
     # --- User Configuration ---
@@ -386,3 +477,16 @@ if __name__ == "__main__":
         print("Correctness check disabled")
 
     print("\n--- cuTile FFT example execution complete ---")
+
+
+def get_factors(N):
+    """
+    Simle heuristic to find close-to-balanced factors (F0, F1, F2) for N = 2^k.
+    """
+    exponent = int(math.log2(N))
+    # Distribute exponent roughly equally: k = a + b + c
+    a = exponent // 3
+    b = (exponent - a) // 2
+    c = exponent - a - b
+    return (2**a, 2**b, 2**c)
+

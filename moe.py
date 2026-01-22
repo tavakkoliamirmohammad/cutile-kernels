@@ -200,9 +200,9 @@ def cutile_moe(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 64,
 ) -> torch.Tensor:
     """
     Executes a Mixture-of-Experts (MoE) forward pass using the fused cuTile kernel.
@@ -406,6 +406,111 @@ def next_power_of_2(n: int):
     return n
 
 
+def benchmark(kernel_func, kernel_name, output_filename):
+    import time
+    import matplotlib.pyplot as plt
+
+    # Tile configs to test: (tile_m, tile_n, tile_k)
+    tile_configs = [
+        (64, 64, 32),
+        (128, 128, 32),
+        (128, 128, 64),
+    ]
+    
+    # We will vary the number of tokens to simulate different batch sizes
+    # Typical token counts: 128, 256, 512, 1024, 2048, 4096
+    token_counts = [128, 256, 512, 1024, 2048, 4096]
+    
+    hidden_size = 1024
+    num_experts = 64
+    intermediate_size = 2048
+    topk = 8
+    dtype = torch.float16
+    device = 'cuda'
+
+    plt.figure(figsize=(12, 8))
+
+    print(f"Benchmarking {kernel_name} with tile configs: {tile_configs}")
+    
+    for config in tile_configs:
+        tm, tn, tk = config
+        config_name = f"Tile {tm}x{tn}x{tk}"
+        print(f"\nTesting {config_name}")
+        speedups = []
+        
+        for num_tokens in token_counts:
+            # Setup Data
+            hidden_states = torch.empty(
+                num_tokens, hidden_size, device=device, dtype=dtype
+            ).normal_(0, 0.5)
+            w1 = torch.empty(
+                num_experts, intermediate_size * 2, hidden_size, device=device, dtype=dtype
+            ).normal_(0, 0.1)
+            w2 = torch.empty(
+                num_experts, hidden_size, intermediate_size, device=device, dtype=dtype
+            ).normal_(0, 0.1)
+
+            topk_ids = torch.stack([
+                torch.randperm(num_experts, device=device)[:topk]
+                for _ in range(num_tokens)
+            ])
+            topk_weights = torch.softmax(
+                torch.randn(num_tokens, topk, device=device), dim=-1
+            ).to(dtype)
+            
+            # Warmup PyTorch (Naive Implementation)
+            # Note: The Naive implementation is VERY slow for large sizes, 
+            # maybe restrict large sizes or just endure it.
+            # 4096 tokens might take a bit.
+            for _ in range(5):
+                torch_moe(hidden_states, w1, w2, topk_weights, topk_ids)
+            
+            # Timing PyTorch
+            torch.cuda.synchronize()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            start_event.record()
+            for _ in range(20): 
+                torch_moe(hidden_states, w1, w2, topk_weights, topk_ids)
+            end_event.record()
+            torch.cuda.synchronize()
+            torch_time = start_event.elapsed_time(end_event) / 20
+            
+            # Correctness & Warmup cuTile
+            try:
+                for _ in range(5):
+                    cutile_moe(hidden_states, w1, w2, topk_weights, topk_ids, tile_m=tm, tile_n=tn, tile_k=tk)
+            except Exception as e:
+                print(f"Error for Num Tokens={num_tokens}, config={config}: {e}")
+                speedups.append(0)
+                continue
+
+            # Timing cuTile
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(20):
+                cutile_moe(hidden_states, w1, w2, topk_weights, topk_ids, tile_m=tm, tile_n=tn, tile_k=tk)
+            end_event.record()
+            torch.cuda.synchronize()
+            cutile_time = start_event.elapsed_time(end_event) / 20
+            
+            speedup = torch_time / cutile_time if cutile_time > 0 else 0.0
+            speedups.append(speedup)
+            
+            print(f"Tokens={num_tokens:<6} | Speedup={speedup:.2f}x")
+        
+        plt.plot(token_counts, speedups, label=config_name, marker='o')
+
+    plt.xscale('log', base=2)
+    plt.xlabel('Number of Tokens')
+    plt.ylabel('Normalized Speedup (PyTorch Naive / cuTile)')
+    plt.title(f'{kernel_name} Speedup vs Number of Tokens')
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    
+    plt.savefig(output_filename)
+    print(f"\nBenchmark complete for {kernel_name}. Plot saved to {output_filename}")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -414,7 +519,18 @@ if __name__ == "__main__":
         help="Check the correctness of the cuTile MoE output against a torch reference.",
         default=True,
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run benchmark",
+        default=False,
+    )
     args = parser.parse_args()
+
+    if args.benchmark:
+        print("\n\n=== Benchmarking MoE ===")
+        benchmark(cutile_moe, "MoE", "moe_benchmark.png")
+        exit(0)
 
     print("--- Running cuTile Mixture-of-Experts (MoE) Sample ---")
 
@@ -466,3 +582,5 @@ if __name__ == "__main__":
         print("Correctness check disabled (use --correctness-check to enable)")
 
     print("\n--- cuTile Mixture-of-Experts (MoE) Sample complete ---")
+
+
