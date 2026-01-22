@@ -176,7 +176,7 @@ def persistent_matmul_kernel(A, B, C,
         ct.store(C, index=(bidx, bidy), tile=accumulator)
 
 
-def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False) -> torch.Tensor:
+def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False, tile_config: tuple = None) -> torch.Tensor:
     """
     Performs matrix multiplication C = A @ B using a cuTile kernel with a 2D grid.
 
@@ -189,6 +189,7 @@ def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False) ->
         B (torch.Tensor): The second input matrix (K x N). Must be on a CUDA device
                           and have its K dimension match A's K dimension.
         persistent (bool): Whether to use the persistent kernel.
+        tile_config (tuple, optional): A tuple (tm, tn, tk) specifying custom tile sizes.
 
     Returns:
         torch.Tensor: The resulting matrix C (M x N) on the CUDA device.
@@ -212,7 +213,9 @@ def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False) ->
     # the input is half-precision (e.g., float16, bfloat16, where itemsize=2 bytes)
     # which can often leverage Tensor Cores for higher throughput,
     # or full-precision (e.g., float32, where itemsize=4 bytes).
-    if A.dtype.itemsize == 2:  # Likely torch.float16 or torch.bfloat16
+    if tile_config is not None:
+        tm, tn, tk = tile_config
+    elif A.dtype.itemsize == 2:  # Likely torch.float16 or torch.bfloat16
         tm, tn, tk = 128, 256, 64  # Larger tiles for Tensor Core friendly types
     else:  # Likely torch.float32 or other
         tm, tn, tk = 32, 32, 32   # Smaller, more general tiles
@@ -250,6 +253,94 @@ def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False) ->
 
     return C
 
+def benchmark(kernel_func, kernel_name, output_filename, persistent=False):
+    import time
+    import matplotlib.pyplot as plt
+
+    # Tile configs to test: (tm, tn, tk)
+    # Common configurations
+    tile_configs = [
+        (64, 64, 32),
+        (128, 128, 32),
+        (128, 256, 32),
+        (256, 128, 32),
+        (128, 256, 64), # Optimized for A100/H100 fp16 often
+    ]
+    
+    # Square matrix sizes N=512 to N=8192
+    problem_sizes = [512, 1024, 2048, 4096, 8192]
+    
+    plt.figure(figsize=(12, 8))
+
+    print(f"Benchmarking {kernel_name} with tile configs: {tile_configs}")
+    
+    for config in tile_configs:
+        tm, tn, tk = config
+        config_name = f"Tile {tm}x{tn}x{tk}"
+        print(f"\nTesting {config_name}")
+        speedups = []
+        
+        for N in problem_sizes:
+            # Square matrices
+            M, K = N, N
+            
+            # Using float16 for typical matmul benchmarks
+            dtype = torch.float16
+            A = torch.randn(M, K, dtype=dtype, device='cuda')
+            B = torch.randn(K, N, dtype=dtype, device='cuda')
+            
+            # Warmup PyTorch (cuBLAS)
+            for _ in range(10):
+                torch.matmul(A, B)
+            
+            # Timing PyTorch
+            torch.cuda.synchronize()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            start_event.record()
+            for _ in range(50): # 50 iterations for larger matrices
+                torch.matmul(A, B)
+            end_event.record()
+            torch.cuda.synchronize()
+            torch_time = start_event.elapsed_time(end_event) / 50
+            
+            # Correctness & Warmup cuTile
+            try:
+                for _ in range(5):
+                    cutile_matmul(A, B, tile_config=config, persistent=persistent)
+            except Exception as e:
+                print(f"Error for N={N}, config={config}: {e}")
+                speedups.append(0)
+                continue
+
+            # Timing cuTile
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(50):
+                cutile_matmul(A, B, tile_config=config, persistent=persistent)
+            end_event.record()
+            torch.cuda.synchronize()
+            cutile_time = start_event.elapsed_time(end_event) / 50
+            
+            speedup = torch_time / cutile_time if cutile_time > 0 else 0.0
+            speedups.append(speedup)
+            
+            tflops = (2 * M * N * K) / (cutile_time * 1e-3) / 1e12
+            print(f"N={N:<6} | Speedup={speedup:.2f}x | TFLOPS={tflops:.2f}")
+        
+        plt.plot(problem_sizes, speedups, label=config_name, marker='o')
+
+    plt.xscale('log', base=2)
+    plt.xlabel('Matrix Size (N)')
+    plt.ylabel('Normalized Speedup (PyTorch / cuTile)')
+    plt.title(f'{kernel_name} Speedup vs Matrix Size')
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    
+    plt.savefig(output_filename)
+    print(f"\nBenchmark complete for {kernel_name}. Plot saved to {output_filename}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -259,7 +350,21 @@ if __name__ == "__main__":
         help="Check the correctness of the results",
         default=True,
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run benchmark",
+        default=False,
+    )
     args = parser.parse_args()
+
+    if args.benchmark:
+        print("\n\n=== Benchmarking Matmul (Standard) ===")
+        benchmark(cutile_matmul, "Matmul (Standard)", "matmul_standard_benchmark.png", persistent=False)
+        
+        print("\n\n=== Benchmarking Matmul (Persistent) ===")
+        benchmark(cutile_matmul, "Matmul (Persistent)", "matmul_persistent_benchmark.png", persistent=True)
+        exit(0)
 
     # --- Running cuTile Matrix Multiplication Examples ---
     print("--- Running cuTile Matrix Multiplication Examples (2D Grid) ---")
@@ -340,3 +445,5 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("highest")
 
     print("\n--- All cuTile matrix multiplication examples completed. ---")
+
+

@@ -168,7 +168,7 @@ def vec_add_kernel_2d_gather(
 
 
 # --- Wrapper Function to Dispatch to Kernels ---
-def vec_add(a: torch.Tensor, b: torch.Tensor, use_gather: bool = False) -> torch.Tensor:
+def vec_add(a: torch.Tensor, b: torch.Tensor, use_gather: bool = False, tile_size: int = None) -> torch.Tensor:
     """
     Performs element-wise addition of two tensors (vector or matrix) using
     different cuTile kernels based on dimensionality and gather/scatter preference.
@@ -185,6 +185,8 @@ def vec_add(a: torch.Tensor, b: torch.Tensor, use_gather: bool = False) -> torch
                            or non-tile-aligned dimensions).
                            If False, uses direct tiled loads/stores, which are simpler
                            but assume dimensions are perfectly divisible by tile sizes.
+        tile_size (int, optional): The tile size to use. For 1D, this is the tile size.
+                                   For 2D, this sets the TILE_Y (column) size, and TILE_X is derived.
 
     Returns:
         torch.Tensor: The resulting tensor after element-wise addition.
@@ -213,10 +215,13 @@ def vec_add(a: torch.Tensor, b: torch.Tensor, use_gather: bool = False) -> torch
         N = a.shape[0]  # Get the total size of the 1D vector
 
         # Heuristic for TILE size:
-        # Choose a power of 2, up to 1024, that is greater than or equal to N.
-        # This helps in efficient memory access patterns on the GPU.
-        # Handle N=0 gracefully to avoid log2(0) errors.
-        TILE = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
+        if tile_size is not None:
+             TILE = tile_size
+        else:
+            # Choose a power of 2, up to 1024, that is greater than or equal to N.
+            # This helps in efficient memory access patterns on the GPU.
+            # Handle N=0 gracefully to avoid log2(0) errors.
+            TILE = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
 
         # Calculate the grid dimensions for launching the kernel.
         # `math.ceil(N / TILE)` determines the number of blocks needed to cover
@@ -229,8 +234,12 @@ def vec_add(a: torch.Tensor, b: torch.Tensor, use_gather: bool = False) -> torch
         M, N = a.shape  # Get rows (M) and columns (N) of the matrix
 
         # Heuristic for 2D TILE sizes:
-        # TILE_Y is chosen as a power of 2, up to 1024, based on the column dimension.
-        TILE_Y = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
+        if tile_size is not None:
+            TILE_Y = tile_size
+        else:
+            # TILE_Y is chosen as a power of 2, up to 1024, based on the column dimension.
+            TILE_Y = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
+        
         # TILE_X is derived to keep the total elements processed by a block
         # (TILE_X * TILE_Y) around 1024 (a common block size limit for threads).
         TILE_X = max(1, 1024 // TILE_Y)
@@ -245,6 +254,92 @@ def vec_add(a: torch.Tensor, b: torch.Tensor, use_gather: bool = False) -> torch
     return c  # Return the computed output tensor
 
 
+def benchmark(kernel_func, kernel_name, output_filename, use_gather=False, is_2d=False):
+    import time
+    import matplotlib.pyplot as plt
+    
+    tile_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
+    powers = range(20, 29) # 2^20 to 2^28 (approx 1M to 256M elements)
+    # Reduced max power slightly to avoid OOM on smaller GPUs with 2D overheads if any, 
+    # but primarily to keep runtime reasonable.
+    problem_sizes = [2**p for p in powers]
+    
+    plt.figure(figsize=(12, 8))
+    
+    print(f"Benchmarking {kernel_name} with tile sizes: {tile_sizes}")
+    
+    for tile_size in tile_sizes:
+        print(f"\nTesting tile_size = {tile_size}")
+        speedups = []
+        
+        for N in problem_sizes:
+            if is_2d:
+                # Create square-ish matrix with total elements approx N
+                side = int(math.isqrt(N))
+                shape = (side, side)
+                # Adjust N to actual number of elements
+                actual_N = side * side
+            else:
+                shape = (N,)
+                actual_N = N
+
+            a = torch.randn(shape, dtype=torch.float32, device='cuda')
+            b = torch.randn(shape, dtype=torch.float32, device='cuda')
+            
+            # Ground Truth
+            # PyTorch add is element-wise
+            torch_gt = a + b
+            
+            # Warmup and Correctness Check (cuTile)
+            try:
+                for _ in range(5):
+                    cutile_res = kernel_func(a, b, use_gather=use_gather, tile_size=tile_size)
+                    torch.testing.assert_close(cutile_res, torch_gt, rtol=1e-4, atol=1e-4)
+            except Exception as e:
+                print(f"Error for N={actual_N}, tile_size={tile_size}: {e}")
+            
+            # Timing cuTile
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(50):
+                kernel_func(a, b, use_gather=use_gather, tile_size=tile_size)
+            end_event.record()
+            torch.cuda.synchronize()
+            cutile_time = start_event.elapsed_time(end_event) / 50
+            
+            # Warmup PyTorch
+            for _ in range(5):
+                 _ = a + b
+            
+            # Timing PyTorch
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(50):
+                 _ = a + b
+            end_event.record()
+            torch.cuda.synchronize()
+            torch_time = start_event.elapsed_time(end_event) / 50
+            
+            speedup = torch_time / cutile_time if cutile_time > 0 else 0.0
+            speedups.append(speedup)
+            print(f"N={actual_N:<12} | Speedup={speedup:.2f}x")
+        
+        plt.plot(problem_sizes, speedups, label=f'Tile Size {tile_size}', marker='o')
+
+    plt.xscale('log', base=2)
+    plt.xlabel('Total Elements (N)')
+    plt.ylabel('Normalized Speedup (PyTorch / cuTile)')
+    plt.title(f'{kernel_name} Speedup vs Problem Size')
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    
+    plt.savefig(output_filename)
+    print(f"\nBenchmark complete for {kernel_name}. Plot saved to {output_filename}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -253,87 +348,107 @@ if __name__ == "__main__":
         help="Check the correctness of the results",
         default=True,
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run benchmark varying Vector Size N",
+        default=False,
+    )
     args = parser.parse_args()
 
-    print("--- Running cuTile Vector/Matrix Addition Examples ---")
+    if args.benchmark:
+        print("\n\n=== Benchmarking VecAdd 1D (Direct) ===")
+        benchmark(vec_add, "Vector Add 1D (Direct)", "vecadd_1d_direct.png", use_gather=False, is_2d=False)
+        
+        print("\n\n=== Benchmarking VecAdd 1D (Gather) ===")
+        benchmark(vec_add, "Vector Add 1D (Gather)", "vecadd_1d_gather.png", use_gather=True, is_2d=False)
 
-    # --- User Configuration ---
-    VECTOR_SIZE_1D = 1_000_000
-    MATRIX_SHAPE_2D = (2048, 1024)  # Rows, Columns
-
-    # --- Test Case 1: 1D Vector Add (Direct Tiled) ---
-    print("\n--- Test 1: 1D Vector Add (Direct Tiled) ---")
-    # Create random input tensors on the CUDA device.
-    a_1d_direct = torch.randn(VECTOR_SIZE_1D, dtype=torch.float32, device='cuda')
-    b_1d_direct = torch.randn(VECTOR_SIZE_1D, dtype=torch.float32, device='cuda')
-    print(f"Input 1D shape: {a_1d_direct.shape}, dtype: {a_1d_direct.dtype}")
-
-    # Call the vec_add wrapper function, requesting the direct tiled kernel.
-    c_1d_cutile_direct = vec_add(a_1d_direct, b_1d_direct, use_gather=False)
-    print(
-        f"""cuTile Output 1D shape: {c_1d_cutile_direct.shape},
-        dtype: {c_1d_cutile_direct.dtype}""")
-    if args.correctness_check:
-        torch.testing.assert_close(c_1d_cutile_direct, a_1d_direct + b_1d_direct)
-        print("Correctness check passed")
+        print("\n\n=== Benchmarking VecAdd 2D (Direct) ===")
+        benchmark(vec_add, "Vector Add 2D (Direct)", "vecadd_2d_direct.png", use_gather=False, is_2d=True)
+        
+        print("\n\n=== Benchmarking VecAdd 2D (Gather) ===")
+        benchmark(vec_add, "Vector Add 2D (Gather)", "vecadd_2d_gather.png", use_gather=True, is_2d=True)
     else:
-        print("Correctness check disabled")
 
-    # --- Test Case 2: 1D Vector Add (Gather/Scatter) ---
-    print("\n--- Test 2: 1D Vector Add (Gather/Scatter) ---")
-    # Use a size not perfectly divisible by typical TILE_SIZE to demonstrate
-    # the gather/scatter kernel's robust boundary handling.
-    VECTOR_SIZE_1D_GATHER = 1_000_001
-    a_1d_gather = torch.randn(VECTOR_SIZE_1D_GATHER, dtype=torch.float32, device='cuda')
-    b_1d_gather = torch.randn(VECTOR_SIZE_1D_GATHER, dtype=torch.float32, device='cuda')
-    print(f"Input 1D (gather) shape: {a_1d_gather.shape}, dtype: {a_1d_gather.dtype}")
+        print("--- Running cuTile Vector/Matrix Addition Examples ---")
 
-    # Call the vec_add wrapper function, requesting the gather/scatter kernel.
-    c_1d_cutile_gather = vec_add(a_1d_gather, b_1d_gather, use_gather=True)
-    print(
-        f"""cuTile Output 1D (gather) shape: {c_1d_cutile_gather.shape},
-        dtype: {c_1d_cutile_gather.dtype}""")
-    if args.correctness_check:
-        torch.testing.assert_close(c_1d_cutile_gather, a_1d_gather + b_1d_gather)
-        print("Correctness check passed")
-    else:
-        print("Correctness check disabled")
+        # --- User Configuration ---
+        VECTOR_SIZE_1D = 1_000_000
+        MATRIX_SHAPE_2D = (2048, 1024)  # Rows, Columns
 
-    # --- Test Case 3: 2D Matrix Add (Direct Tiled) ---
-    print("\n--- Test 3: 2D Matrix Add (Direct Tiled) ---")
-    a_2d_direct = torch.randn(MATRIX_SHAPE_2D, dtype=torch.float32, device='cuda')
-    b_2d_direct = torch.randn(MATRIX_SHAPE_2D, dtype=torch.float32, device='cuda')
-    print(f"Input 2D shape: {a_2d_direct.shape}, dtype: {a_2d_direct.dtype}")
+        # --- Test Case 1: 1D Vector Add (Direct Tiled) ---
+        print("\n--- Test 1: 1D Vector Add (Direct Tiled) ---")
+        # Create random input tensors on the CUDA device.
+        a_1d_direct = torch.randn(VECTOR_SIZE_1D, dtype=torch.float32, device='cuda')
+        b_1d_direct = torch.randn(VECTOR_SIZE_1D, dtype=torch.float32, device='cuda')
+        print(f"Input 1D shape: {a_1d_direct.shape}, dtype: {a_1d_direct.dtype}")
 
-    # Call the vec_add wrapper function for 2D, requesting the direct tiled kernel.
-    c_2d_cutile_direct = vec_add(a_2d_direct, b_2d_direct, use_gather=False)
-    print(
-        f"""cuTile Output 2D shape: {c_2d_cutile_direct.shape},
-        dtype: {c_2d_cutile_direct.dtype}""")
-    if args.correctness_check:
-        torch.testing.assert_close(c_2d_cutile_direct, a_2d_direct + b_2d_direct)
-        print("Correctness check passed")
-    else:
-        print("Correctness check disabled")
+        # Call the vec_add wrapper function, requesting the direct tiled kernel.
+        c_1d_cutile_direct = vec_add(a_1d_direct, b_1d_direct, use_gather=False)
+        print(
+            f"""cuTile Output 1D shape: {c_1d_cutile_direct.shape},
+            dtype: {c_1d_cutile_direct.dtype}""")
+        if args.correctness_check:
+            torch.testing.assert_close(c_1d_cutile_direct, a_1d_direct + b_1d_direct)
+            print("Correctness check passed")
+        else:
+            print("Correctness check disabled")
 
-    # --- Test Case 4: 2D Matrix Add (Gather/Scatter) ---
-    print("\n--- Test 4: 2D Matrix Add (Gather/Scatter) ---")
-    # Use dimensions not perfectly divisible by typical tile sizes to demonstrate
-    # the gather/scatter kernel's robust boundary handling in 2D.
-    MATRIX_SHAPE_2D_GATHER = (2000, 1000)
-    a_2d_gather = torch.randn(MATRIX_SHAPE_2D_GATHER, dtype=torch.float32, device='cuda')
-    b_2d_gather = torch.randn(MATRIX_SHAPE_2D_GATHER, dtype=torch.float32, device='cuda')
-    print(f"Input 2D (gather) shape: {a_2d_gather.shape}, dtype: {a_2d_gather.dtype}")
+        # --- Test Case 2: 1D Vector Add (Gather/Scatter) ---
+        print("\n--- Test 2: 1D Vector Add (Gather/Scatter) ---")
+        # Use a size not perfectly divisible by typical TILE_SIZE to demonstrate
+        # the gather/scatter kernel's robust boundary handling.
+        VECTOR_SIZE_1D_GATHER = 1_000_001
+        a_1d_gather = torch.randn(VECTOR_SIZE_1D_GATHER, dtype=torch.float32, device='cuda')
+        b_1d_gather = torch.randn(VECTOR_SIZE_1D_GATHER, dtype=torch.float32, device='cuda')
+        print(f"Input 1D (gather) shape: {a_1d_gather.shape}, dtype: {a_1d_gather.dtype}")
 
-    # Call the vec_add wrapper function for 2D, requesting the gather/scatter kernel.
-    c_2d_cutile_gather = vec_add(a_2d_gather, b_2d_gather, use_gather=True)
-    print(
-        f"""cuTile Output 2D (gather) shape: {c_2d_cutile_gather.shape},
-        dtype: {c_2d_cutile_gather.dtype}""")
-    if args.correctness_check:
-        torch.testing.assert_close(c_2d_cutile_gather, a_2d_gather + b_2d_gather)
-        print("Correctness check passed")
-    else:
-        print("Correctness check disabled")
+        # Call the vec_add wrapper function, requesting the gather/scatter kernel.
+        c_1d_cutile_gather = vec_add(a_1d_gather, b_1d_gather, use_gather=True)
+        print(
+            f"""cuTile Output 1D (gather) shape: {c_1d_cutile_gather.shape},
+            dtype: {c_1d_cutile_gather.dtype}""")
+        if args.correctness_check:
+            torch.testing.assert_close(c_1d_cutile_gather, a_1d_gather + b_1d_gather)
+            print("Correctness check passed")
+        else:
+            print("Correctness check disabled")
 
-    print("\n--- cuTile Vector/Matrix Addition examples complete ---")
+        # --- Test Case 3: 2D Matrix Add (Direct Tiled) ---
+        print("\n--- Test 3: 2D Matrix Add (Direct Tiled) ---")
+        a_2d_direct = torch.randn(MATRIX_SHAPE_2D, dtype=torch.float32, device='cuda')
+        b_2d_direct = torch.randn(MATRIX_SHAPE_2D, dtype=torch.float32, device='cuda')
+        print(f"Input 2D shape: {a_2d_direct.shape}, dtype: {a_2d_direct.dtype}")
+
+        # Call the vec_add wrapper function for 2D, requesting the direct tiled kernel.
+        c_2d_cutile_direct = vec_add(a_2d_direct, b_2d_direct, use_gather=False)
+        print(
+            f"""cuTile Output 2D shape: {c_2d_cutile_direct.shape},
+            dtype: {c_2d_cutile_direct.dtype}""")
+        if args.correctness_check:
+            torch.testing.assert_close(c_2d_cutile_direct, a_2d_direct + b_2d_direct)
+            print("Correctness check passed")
+        else:
+            print("Correctness check disabled")
+
+        # --- Test Case 4: 2D Matrix Add (Gather/Scatter) ---
+        print("\n--- Test 4: 2D Matrix Add (Gather/Scatter) ---")
+        # Use dimensions not perfectly divisible by typical tile sizes to demonstrate
+        # the gather/scatter kernel's robust boundary handling in 2D.
+        MATRIX_SHAPE_2D_GATHER = (2000, 1000)
+        a_2d_gather = torch.randn(MATRIX_SHAPE_2D_GATHER, dtype=torch.float32, device='cuda')
+        b_2d_gather = torch.randn(MATRIX_SHAPE_2D_GATHER, dtype=torch.float32, device='cuda')
+        print(f"Input 2D (gather) shape: {a_2d_gather.shape}, dtype: {a_2d_gather.dtype}")
+
+        # Call the vec_add wrapper function for 2D, requesting the gather/scatter kernel.
+        c_2d_cutile_gather = vec_add(a_2d_gather, b_2d_gather, use_gather=True)
+        print(
+            f"""cuTile Output 2D (gather) shape: {c_2d_cutile_gather.shape},
+            dtype: {c_2d_cutile_gather.dtype}""")
+        if args.correctness_check:
+            torch.testing.assert_close(c_2d_cutile_gather, a_2d_gather + b_2d_gather)
+            print("Correctness check passed")
+        else:
+            print("Correctness check disabled")
+
+        print("\n--- cuTile Vector/Matrix Addition examples complete ---")
