@@ -88,6 +88,7 @@ def benchmark_babelstream(N, provider_ts, op, dtype_str=PRECISION):
         'float64': torch.float64,
         'half': torch.float16,
         'float32': torch.float32,
+        'float16': torch.float16,
     }
     torch_dtype = dtype_map[dtype_str]
     element_size = torch.tensor([], dtype=torch_dtype).element_size()
