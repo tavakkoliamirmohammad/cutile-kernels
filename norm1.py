@@ -1,8 +1,52 @@
-import cuda.tile as ct
-import torch
-import triton
 import argparse
+import torch
+import cuda.tile as ct
+import math
+import triton
 import os
+
+ConstInt = ct.Constant[int]
+
+@ct.kernel
+def norm1_kernel(a, result, tile_size: ConstInt):
+    """
+    cuTile kernel for computing the L1 norm of a vector.
+    """
+    pid = ct.bid(0)
+    
+    # Load input tile
+    a_tile = ct.load(a, index=(pid,), shape=(tile_size,))
+    
+    # Compute Absolute Value
+    abs_tile = ct.maximum(a_tile, -a_tile)
+    
+    # Reduce tile to scalar sum
+    partial_sum = ct.sum(abs_tile)
+    
+    # Atomically add partial sum to global result
+    ct.atomic_add(result, (0,), partial_sum)
+
+@ct.kernel
+def norm1_no_atomic_kernel(a, result, tile_size: ConstInt):
+    """
+    cuTile kernel for computing the L1 norm of a vector without atomics.
+    Each block writes its partial sum to a specific index in the result array.
+    """
+    pid = ct.bid(0)
+    
+    # Load input tile
+    a_tile = ct.load(a, index=(pid,), shape=(tile_size,))
+    
+    # Compute Absolute Value
+    abs_tile = ct.maximum(a_tile, -a_tile)
+    
+    # Reduce tile to scalar sum
+    partial_sum = ct.sum(abs_tile)
+    
+    # Write partial sum to result array at index pid
+    ct.store(result, index=(pid,), tile=partial_sum)
+
+# --- Triton Benchmarking Boilerplate ---
 
 TILE_SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
 TILE_COLORS = ['tab:blue', 'tab:red', 'tab:orange', 'tab:purple', 'tab:brown', 'tab:pink', 'tab:gray']
@@ -11,22 +55,6 @@ parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--precision", type=str, default="float32", choices=["float64", "float32", "half"])
 args, _ = parser.parse_known_args()
 PRECISION = args.precision
-
-@ct.kernel
-def norm1_kernel(a, result, tile_size: ct.Constant[int]):
-    pid = ct.bid(0)
-    a_tile = ct.load(a, index=(pid,), shape=(tile_size,))
-    abs_tile = ct.maximum(a_tile, -a_tile)
-    partial_sum = ct.sum(abs_tile)
-    ct.atomic_add(result, (0,), partial_sum)
-
-@ct.kernel
-def norm1_no_atomic_kernel(a, result, tile_size: ct.Constant[int]):
-    pid = ct.bid(0)
-    a_tile = ct.load(a, index=(pid,), shape=(tile_size,))
-    abs_tile = ct.maximum(a_tile, -a_tile)
-    partial_sum = ct.sum(abs_tile)
-    ct.store(result, index=(pid,), tile=partial_sum)
 
 configs = [
     triton.testing.Benchmark(
@@ -44,18 +72,11 @@ configs = [
 
 @triton.testing.perf_report(configs)
 def benchmark_norm1(N, provider_ts):
-    dtype_map = {
-        'float64': torch.float64,
-        'float32': torch.float32,
-        'half': torch.float16,
-    }
+    dtype_map = {'float64': torch.float64, 'float32': torch.float32, 'half': torch.float16}
     torch_dtype = dtype_map[PRECISION]
     element_size = torch.tensor([], dtype=torch_dtype).element_size()
-
     a = torch.randn(N, dtype=torch_dtype, device='cuda')
-    
     quantiles = [0.5, 0.2, 0.8]
-    
     if provider_ts == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.norm(a, p=1), quantiles=quantiles)
     elif 'atomic' in provider_ts:
@@ -63,56 +84,36 @@ def benchmark_norm1(N, provider_ts):
         num_blocks = (N + tile_size - 1) // tile_size
         result = torch.zeros(1, dtype=torch_dtype, device='cuda')
         stream = torch.cuda.current_stream()
-        
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: ct.launch(
-            stream, (num_blocks, 1, 1), norm1_kernel, (a, result, tile_size)
-        ), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: ct.launch(stream, (num_blocks, 1, 1), norm1_kernel, (a, result, tile_size)), quantiles=quantiles)
     else:
         tile_size = int(provider_ts.split('-')[1])
         num_blocks = (N + tile_size - 1) // tile_size
         result_partials = torch.zeros(num_blocks, dtype=torch_dtype, device='cuda')
         stream = torch.cuda.current_stream()
-        
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: ct.launch(
-            stream, (num_blocks, 1, 1), norm1_no_atomic_kernel, (a, result_partials, tile_size)
-        ), quantiles=quantiles)
-
-    # Verification (only for large N)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: ct.launch(stream, (num_blocks, 1, 1), norm1_no_atomic_kernel, (a, result_partials, tile_size)), quantiles=quantiles)
     if N == 2**20 and provider_ts != 'torch':
          if 'atomic' in provider_ts:
-             tile_size = int(provider_ts.split('-')[-1])
-             num_blocks = (N + tile_size - 1) // tile_size
+             tile_size = int(provider_ts.split('-')[-1]); num_blocks = (N + tile_size - 1) // tile_size
              result = torch.zeros(1, dtype=torch_dtype, device='cuda')
              ct.launch(torch.cuda.current_stream(), (num_blocks, 1, 1), norm1_kernel, (a, result, tile_size))
              cutile_res = result[0]
          else:
-             tile_size = int(provider_ts.split('-')[1])
-             num_blocks = (N + tile_size - 1) // tile_size
+             tile_size = int(provider_ts.split('-')[1]); num_blocks = (N + tile_size - 1) // tile_size
              result_partials = torch.zeros(num_blocks, dtype=torch_dtype, device='cuda')
              ct.launch(torch.cuda.current_stream(), (num_blocks, 1, 1), norm1_no_atomic_kernel, (a, result_partials, tile_size))
              cutile_res = result_partials.sum()
-         
-         torch_res = torch.norm(a, p=1)
-         torch.testing.assert_close(cutile_res, torch_res, rtol=1e-3, atol=1e-3)
-
-    # Bandwidth: 1 Read (a)
+         torch.testing.assert_close(cutile_res, torch.norm(a, p=1), rtol=1e-3, atol=1e-3)
     bytes_transferred = N * element_size
     gbps = lambda ms: (bytes_transferred / 1e9) / (ms * 1e-3)
-    
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 if __name__ == "__main__":
     os.makedirs("results", exist_ok=True)
     import pandas as pd
     pd.DataFrame.to_csv = lambda *args, **kwargs: None
-    
     results = benchmark_norm1.run(print_data=False, return_df=True, show_plots=False)
-    if isinstance(results, list):
-        results = results[0]
-    
+    if isinstance(results, list): results = results[0]
     output_file = f"results/norm1_{PRECISION}.txt"
     with open(output_file, "w") as f:
-        f.write(f"norm1-{PRECISION}:\n")
-        f.write(results.to_string())
-        f.write("\n\n")
+        f.write(f"norm1-{PRECISION}:\n{results.to_string()}\n\n")
     print(f"\nResults dumped to {output_file}")

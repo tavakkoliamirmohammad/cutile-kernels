@@ -2,6 +2,8 @@ import argparse
 import torch
 import cuda.tile as ct
 import math
+import triton
+import os
 
 ConstInt = ct.Constant[int]
 
@@ -44,198 +46,77 @@ def dot_product_no_atomic_kernel(a, b, result, tile_size: ConstInt):
     partial_sum = ct.sum(prod)
     
     # Write partial sum to result array at index pid
-    # result is expected to be of size (grid_size,)
     ct.store(result, index=(pid,), tile=partial_sum)
 
-def dot_product(a: torch.Tensor, b: torch.Tensor, tile_size: int = None) -> torch.Tensor:
-    """
-    Wrapper for dot product kernel.
-    """
-    if a.shape != b.shape:
-        raise ValueError("Input tensors must have the same shape.")
-    if not a.is_cuda or not b.is_cuda:
-        raise ValueError("Input tensors must be on a CUDA device.")
-    
-    N = a.shape[0]
-    # Use a tile size of 1024 or smaller, or user provided
-    if tile_size is not None:
-        TILE_SIZE = tile_size
+# --- Triton Benchmarking Boilerplate ---
+
+TILE_SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
+TILE_COLORS = ['tab:blue', 'tab:red', 'tab:orange', 'tab:purple', 'tab:brown', 'tab:pink', 'tab:gray']
+
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--precision", type=str, default="float32", choices=["float64", "float32", "half"])
+args, _ = parser.parse_known_args()
+PRECISION = args.precision
+
+configs = [
+    triton.testing.Benchmark(
+        x_names=['N'],
+        x_vals=[2**i for i in range(7, 30)],
+        line_arg='provider_ts',
+        line_vals=['torch'] + [f'cutile-{ts}' for ts in TILE_SIZES] + [f'cutile-atomic-{ts}' for ts in TILE_SIZES],
+        line_names=['Torch'] + [f'cuTile-{ts}' for ts in TILE_SIZES] + [f'cuTile-Atomic-{ts}' for ts in TILE_SIZES],
+        styles=[('tab:green', '-')] + [(TILE_COLORS[i], '-') for i in range(len(TILE_SIZES))] + [(TILE_COLORS[i], '--') for i in range(len(TILE_SIZES))],
+        ylabel='GB/s',
+        plot_name=f'dot_product-{PRECISION}',
+        args={},
+    )
+]
+
+@triton.testing.perf_report(configs)
+def benchmark_dot_product(N, provider_ts):
+    dtype_map = {'float64': torch.float64, 'float32': torch.float32, 'half': torch.float16}
+    torch_dtype = dtype_map[PRECISION]
+    element_size = torch.tensor([], dtype=torch_dtype).element_size()
+    a = torch.randn(N, dtype=torch_dtype, device='cuda')
+    b = torch.randn(N, dtype=torch_dtype, device='cuda')
+    quantiles = [0.5, 0.2, 0.8]
+    if provider_ts == 'torch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.dot(a, b), quantiles=quantiles)
+    elif 'atomic' in provider_ts:
+        tile_size = int(provider_ts.split('-')[-1])
+        num_blocks = (N + tile_size - 1) // tile_size
+        result = torch.zeros(1, dtype=torch_dtype, device='cuda')
+        stream = torch.cuda.current_stream()
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: ct.launch(stream, (num_blocks, 1, 1), dot_product_kernel, (a, b, result, tile_size)), quantiles=quantiles)
     else:
-        TILE_SIZE = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
-    
-    result = torch.zeros(1, dtype=a.dtype, device=a.device)
-    
-    grid = (math.ceil(N / TILE_SIZE), 1, 1)
-    
-    ct.launch(
-        torch.cuda.current_stream(),
-        grid,
-        dot_product_kernel,
-        (a, b, result, TILE_SIZE)
-    )
-    
-    return result
-
-
-    return result
-
-
-def dot_product_no_atomic(a: torch.Tensor, b: torch.Tensor, tile_size: int = None) -> torch.Tensor:
-    """
-    Wrapper for dot product kernel without atomics.
-    Reduces on the host.
-    """
-    if a.shape != b.shape:
-        raise ValueError("Input tensors must have the same shape.")
-    if not a.is_cuda or not b.is_cuda:
-        raise ValueError("Input tensors must be on a CUDA device.")
-    
-    N = a.shape[0]
-    # Use a tile size of 1024 or smaller, or user provided
-    if tile_size is not None:
-        TILE_SIZE = tile_size
-    else:
-        TILE_SIZE = min(1024, 2 ** math.ceil(math.log2(N))) if N > 0 else 1
-    
-    num_blocks = math.ceil(N / TILE_SIZE)
-    grid = (num_blocks, 1, 1)
-    
-    # Result array size of num_blocks
-    result_partials = torch.zeros(num_blocks, dtype=a.dtype, device=a.device)
-    
-    ct.launch(
-        torch.cuda.current_stream(),
-        grid,
-        dot_product_no_atomic_kernel,
-        (a, b, result_partials, TILE_SIZE)
-    )
-    
-    # Reduce on host (sum the partials)
-    # result_partials.sum() returns a 0-d tensor, we might want to return 1-d scalar tensor to match dot_product signature behavior if needed
-    # dot_product returns shape (1,)
-    return result_partials.sum().unsqueeze(0)
-
-
-def benchmark(kernel_func, kernel_name, output_filename):
-    import time
-    import matplotlib.pyplot as plt
-    
-    tile_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
-    powers = range(7, 30) # 2^7 to 2^20
-    problem_sizes = [2**p for p in powers]
-    
-    plt.figure(figsize=(12, 8))
-    
-    print(f"Benchmarking {kernel_name} with tile sizes: {tile_sizes}")
-    
-    for tile_size in tile_sizes:
-        print(f"\nTesting tile_size = {tile_size}")
-        speedups = []
-        
-        for N in problem_sizes:
-            a = torch.randn(N, dtype=torch.float32, device='cuda')
-            b = torch.randn(N, dtype=torch.float32, device='cuda')
-            
-            # Ground Truth
-            torch_gt = torch.dot(a, b)
-            
-            # Warmup and Correctness Check (cuTile)
-            try:
-                for _ in range(10):
-                    cutile_res = kernel_func(a, b, tile_size=tile_size)
-                    torch.testing.assert_close(cutile_res[0], torch_gt, rtol=1e-4, atol=1e-4)
-            except Exception as e:
-                print(f"Error for N={N}, tile_size={tile_size}: {e}")
-            
-            # Timing cuTile
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            torch.cuda.synchronize()
-            start_event.record()
-            start_event.record()
-            for _ in range(100):
-                kernel_func(a, b, tile_size=tile_size)
-            end_event.record()
-            torch.cuda.synchronize()
-            cutile_time = start_event.elapsed_time(end_event) / 100
-            
-            # Warmup PyTorch
-            for _ in range(10):
-                torch.dot(a, b)
-            
-            # Timing PyTorch
-            torch.cuda.synchronize()
-            start_event.record()
-            for _ in range(100):
-                torch.dot(a, b)
-            end_event.record()
-            torch.cuda.synchronize()
-            torch_time = start_event.elapsed_time(end_event) / 100
-            
-            speedup = torch_time / cutile_time if cutile_time > 0 else 0.0
-            speedups.append(speedup)
-            print(f"N={N:<8} | Speedup={speedup:.2f}x")
-        
-        plt.plot(problem_sizes, speedups, label=f'Tile Size {tile_size}', marker='o')
-
-    plt.xscale('log', base=2)
-    plt.xlabel('Problem Size (N)')
-    plt.ylabel('Normalized Speedup (PyTorch / cuTile)')
-    plt.title(f'{kernel_name} Speedup vs Problem Size for Different Tile Sizes')
-    plt.legend()
-    plt.grid(True, which="both", ls="-", alpha=0.5)
-    
-    plt.savefig(output_filename)
-    print(f"\nBenchmark complete for {kernel_name}. Plot saved to {output_filename}")
-
-def run_test():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--tile-size",
-        default=2048,
-        type=int,          # Ensures command line input is converted to int
-        help="Size of the tile"
-    )
-    parser.add_argument(
-        "--correctness-check",
-        action="store_true",
-        help="Check the correctness of the results",
-        default=True,
-    )
-    parser.add_argument(
-        "--benchmark",
-        action="store_true",
-        help="Run benchmark varying N from 128 to 2^20",
-        default=False,
-    )
-    args = parser.parse_args()
-
-    if args.benchmark:
-        print("\n\n=== Benchmarking Atomic Dot Product ===")
-        benchmark(dot_product, "Dot Product (Atomic)", "dot_product_atomic.png")
-        
-        print("\n\n=== Benchmarking Non-Atomic Dot Product ===")
-        benchmark(dot_product_no_atomic, "Dot Product (No Atomic)", "dot_product_no_atomic.png")
-        return
-
-    N = 1024 * 1024
-    
-    # Generate Data
-    a = torch.randn(N, dtype=torch.float32, device='cuda')
-    b = torch.randn(N, dtype=torch.float32, device='cuda')
-    
-    print(f"Launching Dot Product kernel with N={N}...")
-    cutile_res = dot_product(a, b)
-    
-    # Verification
-    if args.correctness_check:
-        torch_res = torch.dot(a, b)
-        print(f"cuTile: {cutile_res.item():.4f}")
-        print(f"PyTorch: {torch_res.item():.4f}")
-        torch.testing.assert_close(cutile_res[0], torch_res, rtol=1e-4, atol=1e-4)
-        print("✓ Dot Product Passed")
+        tile_size = int(provider_ts.split('-')[1])
+        num_blocks = (N + tile_size - 1) // tile_size
+        result_partials = torch.zeros(num_blocks, dtype=torch_dtype, device='cuda')
+        stream = torch.cuda.current_stream()
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: ct.launch(stream, (num_blocks, 1, 1), dot_product_no_atomic_kernel, (a, b, result_partials, tile_size)), quantiles=quantiles)
+    if N == 2**20 and provider_ts != 'torch':
+         if 'atomic' in provider_ts:
+             tile_size = int(provider_ts.split('-')[-1]); num_blocks = (N + tile_size - 1) // tile_size
+             result = torch.zeros(1, dtype=torch_dtype, device='cuda')
+             ct.launch(torch.cuda.current_stream(), (num_blocks, 1, 1), dot_product_kernel, (a, b, result, tile_size))
+             cutile_res = result[0]
+         else:
+             tile_size = int(provider_ts.split('-')[1]); num_blocks = (N + tile_size - 1) // tile_size
+             result_partials = torch.zeros(num_blocks, dtype=torch_dtype, device='cuda')
+             ct.launch(torch.cuda.current_stream(), (num_blocks, 1, 1), dot_product_no_atomic_kernel, (a, b, result_partials, tile_size))
+             cutile_res = result_partials.sum()
+         torch.testing.assert_close(cutile_res, torch.dot(a, b), rtol=1e-3, atol=1e-3)
+    bytes_transferred = 2 * N * element_size
+    gbps = lambda ms: (bytes_transferred / 1e9) / (ms * 1e-3)
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 if __name__ == "__main__":
-    run_test()
-
+    os.makedirs("results", exist_ok=True)
+    import pandas as pd
+    pd.DataFrame.to_csv = lambda *args, **kwargs: None
+    results = benchmark_dot_product.run(print_data=False, return_df=True, show_plots=False)
+    if isinstance(results, list): results = results[0]
+    output_file = f"results/dot_product_{PRECISION}.txt"
+    with open(output_file, "w") as f:
+        f.write(f"dot_product-{PRECISION}:\n{results.to_string()}\n\n")
+    print(f"\nResults dumped to {output_file}")

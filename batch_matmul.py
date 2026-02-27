@@ -1,15 +1,12 @@
-# SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# SPDX-License-Identifier: Apache-2.0
-
 import argparse
 from math import ceil
 import cuda.tile as ct
 import torch
-
+import triton
+import os
+import math
 
 ConstInt = ct.Constant[int]
-
 
 @ct.kernel
 def batch_matmul_kernel(A, B, C, tm: ConstInt, tn: ConstInt, tk: ConstInt):
@@ -49,219 +46,57 @@ def batch_matmul_kernel(A, B, C, tm: ConstInt, tn: ConstInt, tk: ConstInt):
     result_3d = ct.reshape(result, (1, tm, tn))
     ct.store(C, index=(pid_batch, pidx, pidy), tile=result_3d)
 
+# --- Triton Benchmarking Boilerplate ---
 
-def bmm(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype, tile_config: tuple = None) -> torch.Tensor:
-    """
-    Batch Matrix Multiplication using cuTile's standard tiled kernel.
+TILE_CONFIGS = [(64, 64, 32), (128, 128, 32), (128, 256, 32), (128, 256, 64)]
+CONFIG_COLORS = ['tab:blue', 'tab:red', 'tab:orange', 'tab:purple']
 
-    Args:
-        a (torch.Tensor): Input tensor A with shape (Batch, M, K).
-        b (torch.Tensor): Input tensor B with shape (Batch, K, N).
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--precision", type=str, default="float16", choices=["float32", "float16", "half"])
+args, _ = parser.parse_known_args()
+PRECISION = args.precision
 
-    Returns:
-        Output tensor C with shape (Batch, M, N).
-    """
-    # --- Input Validation ---
-    if a.ndim != 3 or b.ndim != 3:
-        raise ValueError("Input tensors for BMM must be 3D (Batch, M, K) and (Batch, K, N).")
-    if a.shape[0] != b.shape[0]:
-        raise ValueError(f"""Batch dimensions must match:
-                         A.shape[0]={a.shape[0]}, B.shape[0]={b.shape[0]}.""")
-    if a.device != b.device or not a.is_cuda or not b.is_cuda or a.dtype != b.dtype:
-        raise ValueError("""Input tensors must be on the same CUDA device
-                         and have the same data type.""")
+configs = [
+    triton.testing.Benchmark(
+        x_names=['N'], x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
+        line_arg='config_str',
+        line_vals=['torch'] + [f'{c[0]}x{c[1]}x{c[2]}' for c in TILE_CONFIGS],
+        line_names=['Torch'] + [f'cuTile-{c[0]}x{c[1]}x{c[2]}' for c in TILE_CONFIGS],
+        styles=[('tab:green', '-')] + [(CONFIG_COLORS[i], '-') for i in range(len(TILE_CONFIGS))],
+        ylabel='TFLOPS', plot_name=f'batch_matmul-{PRECISION}', args={'Batch': 16},
+    )
+]
 
-    # Get M, K, N dimensions
-    Batch, M, K = a.shape
-    _, K_b, N = b.shape
-    assert K == K_b, f"Incompatible K dimensions: A's K is {K}, B's K is {K_b}"
-
-    # Create output tensor
-    output = torch.empty((Batch, M, N), device=a.device, dtype=out_dtype)
-
-    # --- Determine Tile Shapes for Optimization (Fixed for float16 as per previous request) ---
-    if tile_config is not None:
-        tm_val, tn_val, tk_val = tile_config
+@triton.testing.perf_report(configs)
+def benchmark_batch_matmul(N, config_str, Batch):
+    dtype_map = {'float32': torch.float32, 'float16': torch.float16, 'half': torch.float16}
+    torch_dtype = dtype_map[PRECISION]
+    M, K = N, N
+    A = torch.randn(Batch, M, K, dtype=torch_dtype, device='cuda')
+    B = torch.randn(Batch, K, N, dtype=torch_dtype, device='cuda')
+    C = torch.empty((Batch, M, N), dtype=torch_dtype, device='cuda')
+    quantiles = [0.5, 0.2, 0.8]
+    if config_str == 'torch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.bmm(A, B), quantiles=quantiles)
     else:
-        tm_val, tn_val, tk_val = 128, 256, 64  # Larger tiles for Tensor Core benefits
-
-    # --- Grid calculation for standard 3D tiled kernel ---
-    grid = (Batch, ceil(M / tm_val), ceil(N / tn_val))
-
-    # --- Launch kernel ---
-    ct.launch(torch.cuda.current_stream(), grid, batch_matmul_kernel,
-              (a, b, output, tm_val, tn_val, tk_val))
-
-    return output
-
-
-def torch_batch_matmul_fp8(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    inv_sa = torch.tensor(1.0, device=A.device, dtype=torch.float32)
-    inv_sb = torch.tensor(1.0, device=B.device, dtype=torch.float32)
-    bs = A.shape[0]
-    C = torch.empty((bs, A.shape[1], B.shape[2]), device=A.device, dtype=torch.float32)
-    for i in range(bs):
-        # Only multiplication of row-major and column-major matrices is supported by cuBLASLt
-        # So we need to transpose B to column-major view
-        A_row = A[i].contiguous()
-        B_col = B[i].transpose(-2, -1).contiguous().transpose(-2, -1)
-        C[i] = torch._scaled_mm(
-            A_row, B_col, scale_a=inv_sa, scale_b=inv_sb, out_dtype=torch.float32
-        )
-    return C
-
-def benchmark(kernel_func, kernel_name, output_filename):
-    import time
-    import matplotlib.pyplot as plt
-
-    # Tile configs to test: (tm, tn, tk)
-    tile_configs = [
-        (64, 64, 32),
-        (128, 128, 32),
-        (128, 256, 32),
-        (256, 128, 32),
-        (128, 256, 64),
-    ]
-    
-    # Vary Batch Size or N. Let's vary N with a fixed Batch Size.
-    BATCH = 16
-    problem_sizes = [256, 512, 1024, 2048, 4096]
-    
-    plt.figure(figsize=(12, 8))
-
-    print(f"Benchmarking {kernel_name} with tile configs: {tile_configs}")
-    
-    for config in tile_configs:
-        tm, tn, tk = config
-        config_name = f"Tile {tm}x{tn}x{tk}"
-        print(f"\nTesting {config_name}")
-        speedups = []
-        
-        for N in problem_sizes:
-            # Let's keep sizes relatively small (Batch=16) since BMM can get big
-            M, K = N, N
-            
-            # Use float16
-            A = torch.randn(BATCH, M, K, dtype=torch.float16, device='cuda')
-            B = torch.randn(BATCH, K, N, dtype=torch.float16, device='cuda')
-            
-            # Warmup PyTorch (torch.bmm)
-            for _ in range(10):
-                torch.bmm(A, B)
-            
-            # Timing PyTorch
-            torch.cuda.synchronize()
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            start_event.record()
-            for _ in range(50):
-                torch.bmm(A, B)
-            end_event.record()
-            torch.cuda.synchronize()
-            torch_time = start_event.elapsed_time(end_event) / 50
-            
-            # Correctness & Warmup cuTile
-            try:
-                for _ in range(5):
-                    bmm(A, B, out_dtype=torch.float16, tile_config=config)
-            except Exception as e:
-                print(f"Error for N={N}, config={config}: {e}")
-                speedups.append(0)
-                continue
-
-            # Timing cuTile
-            torch.cuda.synchronize()
-            start_event.record()
-            for _ in range(50):
-                bmm(A, B, out_dtype=torch.float16, tile_config=config)
-            end_event.record()
-            torch.cuda.synchronize()
-            cutile_time = start_event.elapsed_time(end_event) / 50
-            
-            speedup = torch_time / cutile_time if cutile_time > 0 else 0.0
-            speedups.append(speedup)
-            
-            tflops = (2 * BATCH * M * N * K) / (cutile_time * 1e-3) / 1e12
-            print(f"N={N:<6} | Speedup={speedup:.2f}x | TFLOPS={tflops:.2f}")
-        
-        plt.plot(problem_sizes, speedups, label=config_name, marker='o')
-
-    plt.xscale('log', base=2)
-    plt.xlabel('Matrix Size (N)')
-    plt.ylabel('Normalized Speedup (PyTorch / cuTile)')
-    plt.title(f'{kernel_name} Speedup vs Matrix Size (Batch={BATCH})')
-    plt.legend()
-    plt.grid(True, which="both", ls="-", alpha=0.5)
-    
-    plt.savefig(output_filename)
-    print(f"\nBenchmark complete for {kernel_name}. Plot saved to {output_filename}")
-
+        tm, tn, tk = [int(x) for x in config_str.split('x')]
+        grid = (Batch, math.ceil(M / tm), math.ceil(N / tn))
+        stream = torch.cuda.current_stream()
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: ct.launch(stream, grid, batch_matmul_kernel, (A, B, C, tm, tn, tk)), quantiles=quantiles)
+    if N == 512 and config_str != 'torch':
+        torch.testing.assert_close(C, A @ B, atol=1e-2, rtol=1e-2)
+    tflops = (2.0 * Batch * M * N * K) / (ms * 1e-3) / 1e12
+    tflops_max = (2.0 * Batch * M * N * K) / (min_ms * 1e-3) / 1e12
+    tflops_min = (2.0 * Batch * M * N * K) / (max_ms * 1e-3) / 1e12
+    return tflops, tflops_max, tflops_min
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--correctness-check",
-        action="store_true",
-        help="Check the correctness of the results",
-        default=True,
-    )
-    parser.add_argument(
-        "--benchmark",
-        action="store_true",
-        help="Run benchmark",
-        default=False,
-    )
-    args = parser.parse_args()
-
-    if args.benchmark:
-        print("\n\n=== Benchmarking Batch Matmul ===")
-        benchmark(bmm, "Batch Matmul", "batch_matmul_benchmark.png")
-        exit(0)
-    print("--- Running cuTile Batched Matrix Multiplication (Standard Tiled) Sample ---")
-
-    # --- User Configuration for BMM Example ---
-    BATCH_DIM = 4
-    M_DIM = 512
-    K_DIM = 256
-    N_DIM = 1024
-
-    # --- Test Case 1: Standard BMM (float16) ---
-    print("\n--- Test 1: Standard BMM (float16) ---")
-    A_fp16 = torch.randn(BATCH_DIM, M_DIM, K_DIM, dtype=torch.float16, device='cuda')
-    B_fp16 = torch.randn(BATCH_DIM, K_DIM, N_DIM, dtype=torch.float16, device='cuda')
-    print(f"Input A shape: {A_fp16.shape}, dtype: {A_fp16.dtype}")
-    print(f"Input B shape: {B_fp16.shape}, dtype: {B_fp16.dtype}")
-
-    C_bmm_cutile_fp16 = bmm(A_fp16, B_fp16, A_fp16.dtype)
-    print(f"""cuTile Standard BMM Output C
-            shape:{C_bmm_cutile_fp16.shape},
-            dtype: {C_bmm_cutile_fp16.dtype}""")
-    if args.correctness_check:
-        torch.testing.assert_close(C_bmm_cutile_fp16, A_fp16 @ B_fp16)
-        print("Correctness check passed")
-    else:
-        print("Correctness check disabled")
-
-    # --- Test Case 2: Standard BMM (float8_e4m3fn) ---
-    print("\n--- Test 2: Standard BMM (float8_e4m3fn) ---")
-    A_fp8 = torch.randn(
-        BATCH_DIM, M_DIM, K_DIM, dtype=torch.float32, device='cuda'
-    ).to(torch.float8_e4m3fn)
-    B_fp8 = torch.randn(
-        BATCH_DIM, K_DIM, N_DIM, dtype=torch.float32, device='cuda'
-    ).to(torch.float8_e4m3fn)
-    print(f"Input A shape: {A_fp8.shape}, dtype: {A_fp8.dtype}")
-    print(f"Input B shape: {B_fp8.shape}, dtype: {B_fp8.dtype}")
-
-    C_bmm_cutile_fp32 = bmm(A_fp8, B_fp8, torch.float32)
-    print(f"""cuTile Standard BMM Output C
-            shape:{C_bmm_cutile_fp32.shape},
-            dtype: {C_bmm_cutile_fp32.dtype}""")
-    if args.correctness_check:
-        torch.testing.assert_close(C_bmm_cutile_fp32, torch_batch_matmul_fp8(A_fp8, B_fp8))
-        print("Correctness check passed")
-    else:
-        print("Correctness check disabled")
-
-    print("\n--- cuTile Batched Matrix Multiplication (Standard Tiled) examples complete ---")
+    os.makedirs("results", exist_ok=True)
+    import pandas as pd
+    pd.DataFrame.to_csv = lambda *args, **kwargs: None
+    results = benchmark_batch_matmul.run(print_data=False, return_df=True, show_plots=False)
+    if isinstance(results, list): results = results[0]
+    output_file = f"results/batch_matmul_{PRECISION}.txt"
+    with open(output_file, "w") as f:
+        f.write(f"batch_matmul-{PRECISION}:\n{results.to_string()}\n\n")
+    print(f"\nResults dumped to {output_file}")

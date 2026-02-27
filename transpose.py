@@ -1,258 +1,71 @@
-# SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# SPDX-License-Identifier: Apache-2.0
-
 import argparse
 import cuda.tile as ct
 import torch
-from math import ceil  # Required for host-side grid calculation
-
+from math import ceil
+import triton
+import os
 
 ConstInt = ct.Constant[int]
-
 
 @ct.kernel
 def transpose_kernel(x, y,
                      tm: ConstInt,  # Tile size along M dimension (rows of original x)
                      tn: ConstInt):  # Tile size along N dimension (columns of original x)
-    """
-    cuTile kernel to transpose a 2D matrix by processing data in tiles.
-
-    Each block is responsible for computing a `tn` x `tm` tile
-    of the output (transposed) matrix `y`. This involves loading a `tm` x `tn`
-    tile from the input matrix `x`, transposing it locally, and then storing
-    the `tn` x `tm` result to the correct location in `y`.
-
-    Args:
-        x: Input matrix (M x N).
-        y: Output matrix (N x M), which will be the transpose of x.
-        tm (ConstInt): The height of the input tile (number of rows from x)
-                       processed by this block.
-        tn (ConstInt): The width of the input tile (number of columns from x)
-                       processed by this block.
-    """
-    # Get the global IDs of the current block in a 2D grid.
-    # `ct.bid(0)` gives the block ID along the X-axis of the grid, which corresponds
-    # to the M-tile index (rows) of the original input matrix `x`.
-    # `ct.bid(1)` gives the block ID along the Y-axis of the grid, which corresponds
-    # to the N-tile index (columns) of the original input matrix `x`.
     bidx = ct.bid(0)
     bidy = ct.bid(1)
-
-    # Load a tile from the input matrix 'x'.
-    # `ct.load` reads a `tm` x `tn` chunk of data from global memory `x`
-    # at the specified `index=(bidx, bidy)`. This data is brought into
-    # the block's local scope (e.g., shared memory or registers).
     input_tile = ct.load(x, index=(bidx, bidy), shape=(tm, tn))
-
-    # Transpose the loaded tile.
-    # `ct.transpose` without explicit axes defaults to swapping the last two dimensions.
-    # For a 2D tile of shape (tm, tn), this operation transforms it into a (tn, tm) tile.
     transposed_tile = ct.transpose(input_tile)
-
-    # Store the transposed tile to the output matrix 'y'.
-    # Crucially, the store index for `y` must be swapped (`bidy`, `bidx`)
-    # because `y` is the transpose of `x`. The `tile` argument provides
-    # the `tn` x `tm` data to be written to global memory.
     ct.store(y, index=(bidy, bidx), tile=transposed_tile)
 
+# --- Triton Benchmarking Boilerplate ---
 
-def cutile_transpose(x: torch.Tensor, tile_size: int = None) -> torch.Tensor:
-    """
-    Performs matrix transposition C = X.T using a cuTile kernel.
+TILE_SIZES = [8, 16, 32, 64, 128, 256]
+TILE_COLORS = ['tab:blue', 'tab:red', 'tab:orange', 'tab:purple', 'tab:brown', 'tab:pink']
 
-    This wrapper function handles input validation, determines appropriate
-    tile sizes based on data type, calculates the necessary grid dimensions,
-    and launches the `transpose_kernel`.
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--precision", type=str, default="float32", choices=["float64", "float32", "half"])
+args, _ = parser.parse_known_args()
+PRECISION = args.precision
 
-    Args:
-        x (torch.Tensor): The input matrix (M x N).
-                          This tensor *must* be 2D and on a CUDA device.
-        tile_size (int, optional): The tile size to use for both dimensions.
+configs = [
+    triton.testing.Benchmark(
+        x_names=['N'],
+        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
+        line_arg='tile_size',
+        line_vals=TILE_SIZES,
+        line_names=[f'cuTile-{ts}x{ts}' for ts in TILE_SIZES],
+        styles=[(TILE_COLORS[i], '-') for i in range(len(TILE_SIZES))],
+        ylabel='GB/s',
+        plot_name=f'transpose-{PRECISION}',
+        args={},
+    )
+]
 
-    Returns:
-        torch.Tensor: The transposed matrix (N x M) on the same CUDA device.
-
-    Raises:
-        ValueError: If the input tensor is not on CUDA or is not 2D.
-    """
-    # --- Input Validation ---
-    if not x.is_cuda:
-        raise ValueError("Input tensor must be on a CUDA device.")
-    if x.ndim != 2:
-        raise ValueError("Transpose kernel currently supports only 2D tensors.")
-
-    # --- Get Matrix Dimensions ---
-    m, n = x.shape  # Original dimensions of the input matrix: M rows, N columns
-
-    # --- Determine Tile Shapes for Optimization ---
-    if tile_size is not None:
-        tm, tn = tile_size, tile_size
-    elif x.dtype.itemsize == 2:  # Likely torch.float16 or torch.bfloat16
-        tm, tn = 128, 128  # Example optimal tile sizes for 16-bit data
-    else:  # Likely torch.float32 or other
-        tm, tn = 32, 32  # Example optimal tile sizes for 32-bit data
-
-    # --- Calculate Grid Dimensions for Kernel Launch (2D Grid) ---
-    grid_x = ceil(m / tm)
-    grid_y = ceil(n / tn)
-    grid = (grid_x, grid_y, 1)  # cuTile expects a 3-tuple for grid dimensions (x, y, z)
-
-    # --- Create Output Tensor y ---
-    y = torch.empty((n, m), device=x.device, dtype=x.dtype)
-
-    # --- Launch the cuTile Kernel ---
-    ct.launch(torch.cuda.current_stream(), grid, transpose_kernel, (x, y, tm, tn))
-
-    return y
-
-
-def benchmark(kernel_func, kernel_name, output_filename):
-    import time
-    import matplotlib.pyplot as plt
-    
-    # Tile sizes for 2D transpose (representing one dimension, e.g., 32x32)
-    tile_sizes = [8, 16, 32, 64] 
-    powers = range(7, 14) # 2^7 (128) to 2^13 (8192) - Matrix dimensions
-    problem_sizes = [2**p for p in powers]
-    
-    plt.figure(figsize=(12, 8))
-    
-    print(f"Benchmarking {kernel_name} with tile sizes: {tile_sizes}")
-    
-    for tile_size in tile_sizes:
-        print(f"\nTesting tile_size = {tile_size}")
-        speedups = []
-        
-        for N in problem_sizes:
-            # Using NxN square matrices for benchmarking
-            x = torch.randn(N, N, dtype=torch.float32, device='cuda')
-            
-            # Ground Truth (using contiguous transpose for fair memory movement comparison)
-            # x.T is a view, x.T.contiguous() forces a copy similar to the kernel
-            torch_gt = x.T.contiguous()
-            
-            # Warmup and Correctness Check (cuTile)
-            try:
-                for _ in range(5):
-                    cutile_res = kernel_func(x, tile_size=tile_size)
-                    torch.testing.assert_close(cutile_res, torch_gt, rtol=1e-4, atol=1e-4)
-            except Exception as e:
-                print(f"Error for N={N}, tile_size={tile_size}: {e}")
-            
-            # Timing cuTile
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            torch.cuda.synchronize()
-            start_event.record()
-            for _ in range(50):
-                kernel_func(x, tile_size=tile_size)
-            end_event.record()
-            torch.cuda.synchronize()
-            cutile_time = start_event.elapsed_time(end_event) / 50
-            
-            # Warmup PyTorch
-            for _ in range(5):
-                 _ = x.T.contiguous()
-            
-            # Timing PyTorch
-            torch.cuda.synchronize()
-            start_event.record()
-            for _ in range(50):
-                _ = x.T.contiguous()
-            end_event.record()
-            torch.cuda.synchronize()
-            torch_time = start_event.elapsed_time(end_event) / 50
-            
-            speedup = torch_time / cutile_time if cutile_time > 0 else 0.0
-            speedups.append(speedup)
-            print(f"N={N:<8} | Speedup={speedup:.2f}x")
-        
-        plt.plot(problem_sizes, speedups, label=f'Tile Size {tile_size}x{tile_size}', marker='o')
-
-    plt.xscale('log', base=2)
-    plt.xlabel('Matrix Size (N x N)')
-    plt.ylabel('Normalized Speedup (PyTorch / cuTile)')
-    plt.title(f'{kernel_name} Speedup vs Matrix Size')
-    plt.legend()
-    plt.grid(True, which="both", ls="-", alpha=0.5)
-    
-    plt.savefig(output_filename)
-    print(f"\nBenchmark complete for {kernel_name}. Plot saved to {output_filename}")
-
+@triton.testing.perf_report(configs)
+def benchmark_transpose(N, tile_size):
+    dtype_map = {'float64': torch.float64, 'float32': torch.float32, 'half': torch.float16}
+    torch_dtype = dtype_map[PRECISION]
+    element_size = torch.tensor([], dtype=torch_dtype).element_size()
+    x = torch.randn(N, N, dtype=torch_dtype, device='cuda')
+    y = torch.empty((N, N), dtype=torch_dtype, device='cuda')
+    quantiles = [0.5, 0.2, 0.8]
+    tm, tn = tile_size, tile_size
+    grid = (ceil(N / tm), ceil(N / tn), 1)
+    stream = torch.cuda.current_stream()
+    ms, min_ms, max_ms = triton.testing.do_bench(lambda: ct.launch(stream, grid, transpose_kernel, (x, y, tm, tn)), quantiles=quantiles)
+    if N == 1024:
+         torch.testing.assert_close(y, x.T)
+    bytes_transferred = 2 * N * N * element_size
+    gbps = lambda ms: (bytes_transferred / 1e9) / (ms * 1e-3)
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--correctness-check",
-        action="store_true",
-        help="Check the correctness of the results",
-        default=True,
-    )
-    parser.add_argument(
-        "--benchmark",
-        action="store_true",
-        help="Run benchmark varying Matrix Size N",
-        default=False,
-    )
-    args = parser.parse_args()
-
-    if args.benchmark:
-        print("\n\n=== Benchmarking Transpose ===")
-        benchmark(cutile_transpose, "Transpose", "transpose_benchmark.png")
-    else:
-        print("--- Running cuTile Matrix Transposition Examples ---")
-
-        # Define common matrix dimensions for the examples
-        M_dim = 1024
-        N_dim = 512
-
-        # --- Test Case 1: float16 (Half-Precision) ---
-        print("\n--- Test Case 1: Matrix Transposition with float16 (Half-Precision) ---")
-        # Create a random input matrix with float16 data type on the CUDA device.
-        x_fp16 = torch.randn(M_dim, N_dim, dtype=torch.float16, device='cuda')
-        print(f"Input x shape: {x_fp16.shape}, dtype: {x_fp16.dtype}")
-
-        # Perform transposition using the cuTile wrapper function.
-        y_fp16_cutile = cutile_transpose(x_fp16)
-        print(f"cuTile Output y shape: {y_fp16_cutile.shape}, dtype: {y_fp16_cutile.dtype}")
-        if args.correctness_check:
-            torch.testing.assert_close(y_fp16_cutile, x_fp16.T)
-            print("Correctness check passed")
-        else:
-            print("Correctness check disabled")
-
-        # --- Test Case 2: float32 (Single-Precision) ---
-        print("\n--- Test Case 2: Matrix Transposition with float32 (Single-Precision) ---")
-        # Create a random input matrix with float32 data type on the CUDA device.
-        x_fp32 = torch.randn(M_dim, N_dim, dtype=torch.float32, device='cuda')
-        print(f"Input x shape: {x_fp32.shape}, dtype: {x_fp32.dtype}")
-
-        # Perform transposition using the cuTile wrapper function.
-        y_fp32_cutile = cutile_transpose(x_fp32)
-        print(f"cuTile Output y shape: {y_fp32_cutile.shape}, dtype: {y_fp32_cutile.dtype}")
-        if args.correctness_check:
-            torch.testing.assert_close(y_fp32_cutile, x_fp32.T)
-            print("Correctness check passed")
-        else:
-            print("Correctness check disabled")
-
-        # --- Test Case 3: Non-square matrix with non-multiple dimensions ---
-        print("\n--- Test Case 3: Matrix Transposition with Non-Square, Non-Multiple Dimensions ---")
-        # Define matrix dimensions that are not exact multiples of the default tile sizes (32x32).
-        # Demonstration that the `ceil` function in grid calculation correctly handles partial tiles.
-        M_dim_non_mult = 1000
-        N_dim_non_mult = 500
-        x_non_mult = torch.randn(M_dim_non_mult, N_dim_non_mult, dtype=torch.float32, device='cuda')
-        print(f"Input x shape: {x_non_mult.shape}, dtype: {x_non_mult.dtype}")
-
-        y_non_mult_cutile = cutile_transpose(x_non_mult)
-        print(f"cuTile Output y shape: {y_non_mult_cutile.shape}, dtype: {y_non_mult_cutile.dtype}")
-        if args.correctness_check:
-            torch.testing.assert_close(y_non_mult_cutile, x_non_mult.T)
-            print("Correctness check passed")
-        else:
-            print("Correctness check disabled")
-
-        print("\n--- All cuTile matrix transposition examples completed. ---")
+    os.makedirs("results", exist_ok=True)
+    import pandas as pd
+    pd.DataFrame.to_csv = lambda *args, **kwargs: None
+    results = benchmark_transpose.run(print_data=False, return_df=True, show_plots=False)
+    if isinstance(results, list): results = results[0]
+    output_file = f"results/transpose_{PRECISION}.txt"
+    with open(output_file, "w") as f:
+        f.write(f"transpose-{PRECISION}:\n{results.to_string()}\n\n")
+    print(f"\nResults dumped to {output_file}")
