@@ -23,7 +23,7 @@ TILE_SIZES = [8, 16, 32, 64, 128, 256]
 TILE_COLORS = ['tab:blue', 'tab:red', 'tab:orange', 'tab:purple', 'tab:brown', 'tab:pink']
 
 parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument("--precision", type=str, default="float32", choices=["float64", "float32", "half"])
+parser.add_argument("--precision", type=str, default="float32", choices=["float64", "float32", "float16", "half"])
 args, _ = parser.parse_known_args()
 PRECISION = args.precision
 
@@ -43,7 +43,7 @@ configs = [
 
 @triton.testing.perf_report(configs)
 def benchmark_transpose(N, tile_size):
-    dtype_map = {'float64': torch.float64, 'float32': torch.float32, 'half': torch.float16}
+    dtype_map = {'float64': torch.float64, 'float32': torch.float32, 'float16': torch.float16, 'half': torch.float16}
     torch_dtype = dtype_map[PRECISION]
     element_size = torch.tensor([], dtype=torch_dtype).element_size()
     x = torch.randn(N, N, dtype=torch_dtype, device='cuda')

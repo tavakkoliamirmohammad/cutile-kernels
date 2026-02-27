@@ -77,7 +77,7 @@ MATMUL_CONFIGS = [(64, 64, 32), (128, 128, 32), (128, 256, 32), (128, 256, 64)]
 CONFIG_COLORS = ['tab:blue', 'tab:red', 'tab:orange', 'tab:purple']
 
 parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument("--precision", type=str, default="float16", choices=["float32", "float16", "half"])
+parser.add_argument("--precision", type=str, default="float32", choices=["float64", "float32", "float16", "half"])
 args, _ = parser.parse_known_args()
 PRECISION = args.precision
 
@@ -97,7 +97,7 @@ configs = [
 
 @triton.testing.perf_report(configs)
 def benchmark_matmul(N, config_str):
-    dtype_map = {'float32': torch.float32, 'float16': torch.float16, 'half': torch.float16}
+    dtype_map = {'float64': torch.float64, 'float32': torch.float32, 'float16': torch.float16, 'half': torch.float16}
     torch_dtype = dtype_map[PRECISION]
     M, K = N, N
     A = torch.randn(M, K, dtype=torch_dtype, device='cuda')

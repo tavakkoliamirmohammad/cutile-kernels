@@ -11,7 +11,7 @@ TILE_SIZES = [128, 256, 512, 1024, 2048, 4096, 8192]
 TILE_COLORS = ['tab:blue', 'tab:red', 'tab:orange', 'tab:purple', 'tab:brown', 'tab:pink', 'tab:gray']
 
 parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument("--precision", type=str, default="float64", choices=["float64", "float32", "half"])
+parser.add_argument("--precision", type=str, default="float32", choices=["float64", "float32", "float16", "half"])
 args, _ = parser.parse_known_args()
 PRECISION = args.precision
 
@@ -153,7 +153,7 @@ def benchmark_babelstream(N, provider_ts, op, dtype_str=PRECISION):
 if __name__ == "__main__":
     # Re-parse with help enabled for final run
     parser = argparse.ArgumentParser()
-    parser.add_argument("--precision", type=str, default="float64", choices=["float64", "float32", "half"])
+    parser.add_argument("--precision", type=str, default="float32", choices=["float64", "float32", "float16", "half"])
     args = parser.parse_args()
     
     # Run the benchmark and get back the DataFrames
