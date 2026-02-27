@@ -72,8 +72,16 @@ for f in files:
         plt.xscale('log', base=2)
         plt.xlabel(x_col)
         
-        plt.ylabel("Performance")
+        plt.ylabel("Performance (GB/s)")
         plt.title(f"Performance Comparison: {block_name}")
+        
+        # Peak Bandwidth (GB/s) = 2 * Memory Clock Rate * (Bus Width / 8)
+        #               = 2 * 14,001 MHz * (512 bits / 8)
+        #               = 1,792,128 MB/s 
+        #               = ~1,792.1 GB/s (or ~1.79 TB/s)
+
+        plt.axhline(y=1792.1, color='red', linestyle='--', label='Peak Bandwidth (1792.1 GB/s)')
+        
         plt.legend()
         plt.grid(True, which="both", ls="-", alpha=0.5)
         
